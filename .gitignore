@@ -1,0 +1,25 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+
+# Large model weights (HuggingFace local downloads)
+models/
+models_cache/
+*.safetensors
+scratch/
+
+# Extracted clips and summary log outputs
+extracted_clips/
+*.log
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS settings
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

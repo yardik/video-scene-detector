@@ -1,0 +1,8 @@
+Observe this video clip carefully and describe exclusively the people present, their exact spatial positions, body postures, and physical actions.
+
+Structure your response strictly into these two sections:
+- PEOPLE & SPATIAL POSITIONS: Describe every person present, their exact placement in the frame (e.g. left, right, center, foreground, background), spatial positioning relative to each other (e.g. sitting side-by-side, standing behind, facing each other), body posture (e.g. seated upright, leaning forward, standing, arms crossed), facial expression, hair/attire, and gaze direction. Mention if their face is visible on camera, or facing away from it.
+
+- ACTIONS & MOVEMENTS: Describe step-by-step the physical movements, hand gestures, body posture changes, and direct interactions between the people across the clip.
+
+Be objective and specific. Focus exclusively on the people, their spatial placement, and their actions.

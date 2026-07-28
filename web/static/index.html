@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Scene Detector — AI Multimodal Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Navigation Header -->
+    <header class="navbar">
+      <div class="logo-group">
+        <span class="logo-icon">🎬</span>
+        <div>
+          <h1 class="logo-title">Video Scene Detector</h1>
+          <p class="logo-subtitle">Qwen2-VL Multimodal Vision Studio</p>
+        </div>
+      </div>
+
+      <!-- Mode Switcher -->
+      <nav class="nav-modes">
+        <button class="nav-mode-btn active" id="navBatchBtn" data-view="batchView"><span>🚀</span> Batch Detection</button>
+        <button class="nav-mode-btn" id="navDebugBtn" data-view="debugView"><span>🔍</span> Debug Model</button>
+      </nav>
+
+      <div class="header-badges">
+        <span class="badge badge-gpu" id="vramBadge">GPU VRAM: -- MB</span>
+        <span class="badge badge-status" id="statusBadge">Idle</span>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <!-- VIEW 1: BATCH SCENE DETECTION -->
+      <div class="view-section active" id="batchView">
+        <div class="two-column-layout">
+      <section class="panel-card config-panel">
+        <h2 class="panel-title"><span>⚡</span> Detection Configuration</h2>
+
+        <!-- Selection Paths -->
+        <div class="form-group">
+          <label for="inputDir">Input Video Path (Single File or Folder)</label>
+          <div class="input-with-action">
+            <input type="text" id="inputDir" placeholder="e.g. C:\videos\movie.mp4 or /path/to/videos" value="">
+            <button class="btn btn-secondary" id="checkInputBtn">Check Path</button>
+          </div>
+          <span class="field-hint" id="inputFolderInfo">Enter a single video file (e.g. video.mp4) OR a whole folder</span>
+        </div>
+
+        <div class="form-group">
+          <label for="outputDir">Output Clips Folder Path</label>
+          <div class="input-with-action">
+            <input type="text" id="outputDir" placeholder="e.g. E:\extracted_clips" value="">
+          </div>
+          <span class="field-hint">Cut video clips will be saved cleanly here without re-encoding</span>
+        </div>
+
+        <!-- Prompt Input & Analysis Card -->
+        <div class="form-group">
+          <label for="promptInput">Target Scene Description Prompt</label>
+          <textarea id="promptInput" rows="3" placeholder="Describe the scene you want to detect..."></textarea>
+        </div>
+
+        <!-- Live Prompt Quality Analysis Card -->
+        <div class="prompt-analyzer-card" id="promptAnalyzerCard">
+          <div class="analyzer-header">
+            <span class="analyzer-title">Prompt Quality Analysis</span>
+            <span class="quality-badge" id="qualityBadge">--</span>
+          </div>
+          <div class="conditions-preview" id="conditionsPreview">
+          </div>
+          <p class="analyzer-hint" id="analyzerHint">Enter a prompt to analyze quality</p>
+        </div>
+
+        <!-- Model Settings -->
+        <div class="form-row">
+          <div class="form-group col-6">
+            <label for="modelSelect">Vision Model</label>
+            <select id="modelSelect">
+              <option value="">Loading models...</option>
+            </select>
+          </div>
+          <div class="form-group col-6">
+            <label for="quantSelect">VRAM Quantization</label>
+            <select id="quantSelect">
+              <option value="4bit" selected>4-bit NF4 bitsandbytes (Recommended)</option>
+              <option value="none">Native bfloat16</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="text-align: right; margin-top: -0.5rem; margin-bottom: 0.75rem;">
+          <button class="btn btn-secondary btn-sm" id="addModelBtn" onclick="openAddModelModal()">
+            <span class="icon">➕</span> Add Model from HuggingFace
+          </button>
+        </div>
+
+        <!-- Coarse Scan Window & Frame Density Controls -->
+        <div class="form-row">
+          <div class="form-group col-6">
+            <div class="slider-header">
+              <label for="coarseWindowSlider">Coarse Scan Window</label>
+              <span class="badge badge-gpu" id="coarseWindowValue">2.0 min</span>
+            </div>
+            <input type="range" id="coarseWindowSlider" min="1" max="5" step="0.5" value="2.0">
+            <span class="field-hint">Window length per coarse pass (1.0 to 5.0 minutes).</span>
+          </div>
+          <div class="form-group col-6">
+            <div class="slider-header">
+              <label for="coarseFramesSlider">Sampled Frames per Window</label>
+              <span class="badge badge-gpu" id="coarseFramesValue">64 frames</span>
+            </div>
+            <input type="range" id="coarseFramesSlider" min="8" max="64" step="4" value="64">
+            <span class="field-hint">Number of frames sampled across window (8 to 64 frames).</span>
+          </div>
+        </div>
+
+        <!-- Dual Model Classification Checkbox & Text LLM Select -->
+        <div class="form-group dual-model-card">
+          <label class="checkbox-label" for="dualModelCheck">
+            <input type="checkbox" id="dualModelCheck" checked>
+            <span class="checkbox-text">🔗 Dual Model Scene Classification</span>
+          </label>
+          <span class="field-hint">Qwen2-VL describes the scene in detail, then a text-only LLM evaluates if the description matches your prompt.</span>
+          <div class="text-model-group" id="textModelGroup">
+            <label for="textModelSelect">Text LLM Classifier Model</label>
+            <select id="textModelSelect">
+              <option value="">Loading models...</option>
+            </select>
+
+            <div class="slider-group">
+              <div class="slider-header">
+                <label for="similarityThresholdSlider">Similarity Match Threshold</label>
+                <span class="badge badge-gpu" id="similarityThresholdValue">50%</span>
+              </div>
+              <input type="range" id="similarityThresholdSlider" min="20" max="90" step="5" value="50">
+              <span class="field-hint">Minimum Text LLM match probability required for a scene to be considered a match (20% to 90%).</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Smart Motion Sampling Checkbox -->
+        <div class="form-group dual-model-card">
+          <label class="checkbox-label" for="smartMotionCheck">
+            <input type="checkbox" id="smartMotionCheck">
+            <span class="checkbox-text">⚡ Smart Motion Keyframe Sampling</span>
+          </label>
+          <span class="field-hint">Filters out duplicate static frames via pixel-motion variance before VLM inference (Disabled by default).</span>
+        </div>
+
+        <!-- SageAttention 2 Checkbox -->
+        <div class="form-group dual-model-card">
+          <label class="checkbox-label" for="sageAttnCheck">
+            <input type="checkbox" id="sageAttnCheck">
+            <span class="checkbox-text">🚀 SageAttention 2 INT8 Acceleration</span>
+          </label>
+          <span class="field-hint">Uses SageAttention 2 Triton kernel with NHD contiguous tensor layout (Disabled by default).</span>
+        </div>
+
+        <!-- System Prompts Editor Panel -->
+        <div class="prompts-card">
+          <div class="prompts-header" id="togglePromptsBtn">
+            <span class="prompts-title">📝 System Prompts Studio (Persistent & Editable)</span>
+            <span class="prompts-toggle-icon" id="promptsToggleIcon">▶</span>
+          </div>
+          <div class="prompts-body hidden" id="promptsBody">
+            <div class="form-group">
+              <label for="captionerPromptInput">Vision Captioner System Prompt</label>
+              <textarea id="captionerPromptInput" rows="4" class="prompt-textarea" placeholder="Loading captioner prompt..."></textarea>
+              <span class="field-hint">Instructions for the vision model when extracting visual details. Saved to <code>prompts/captioner_prompt.txt</code>.</span>
+            </div>
+            <div class="form-group">
+              <label for="matcherPromptInput">Text Matcher System Prompt (Text LLM Classifier)</label>
+              <textarea id="matcherPromptInput" rows="5" class="prompt-textarea" placeholder="Loading matcher prompt..."></textarea>
+              <span class="field-hint">Instructions for the Text LLM when comparing descriptions against prompts. Saved to <code>prompts/matcher_prompt.txt</code>.</span>
+            </div>
+            <div class="prompts-actions">
+              <button class="btn btn-primary btn-sm" id="savePromptsBtn">💾 Save System Prompts</button>
+              <button class="btn btn-secondary btn-sm" id="resetPromptsBtn">🔄 Reset Defaults</button>
+              <span id="promptsStatusMsg" class="prompts-status-msg"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Action Control Buttons -->
+        <div class="action-bar">
+          <button class="btn btn-primary btn-lg" id="startBatchBtn">
+            <span>🚀</span> Start Folder Batch Scan
+          </button>
+          <button class="btn btn-danger btn-lg hidden" id="stopBatchBtn">
+            <span>🛑</span> Stop Scan
+          </button>
+        </div>
+      </section>
+
+      <!-- Right Column: Live Monitor & Gallery -->
+      <section class="panel-card monitor-panel">
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="liveTab"><span>📊</span> Live Monitor</button>
+          <button class="tab-btn" data-tab="galleryTab"><span>🎬</span> Cut Clips Gallery (<span id="clipCountBadge">0</span>)</button>
+        </div>
+
+        <!-- Tab 1: Live Monitor -->
+        <div class="tab-content active" id="liveTab">
+          <!-- Dual Progress Card -->
+          <div class="progress-card">
+            <!-- Overall Batch Progress Bar -->
+            <div class="progress-section">
+              <div class="progress-header">
+                <span>📁 Overall Batch Progress (<span id="batchVideoCountLabel">0 / 0 Videos</span>)</span>
+                <span id="progressPercentLabel" class="percent-badge">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-fill" id="progressBar" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <!-- Current Video Timeline Scan Progress Bar -->
+            <div class="progress-section">
+              <div class="progress-header">
+                <span id="currentVideoLabel">No active batch job</span>
+                <span id="currentScanPercentLabel" class="percent-badge">0%</span>
+              </div>
+              <div class="progress-track progress-track-secondary">
+                <div class="progress-fill progress-fill-secondary" id="currentScanProgressBar" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <div class="progress-meta">
+              <span>Phase: <strong id="phaseLabel" class="highlight-text">--</strong></span>
+              <span>Scenes Found: <strong id="scenesFoundLabel" class="highlight-text">0</strong></span>
+              <span>Elapsed: <strong id="elapsedLabel" class="highlight-text">0.0s</strong></span>
+            </div>
+          </div>
+
+          <!-- Colorized Terminal Log Stream -->
+          <div class="log-container">
+            <div class="log-header">
+              <span>Real-Time Execution Logs</span>
+              <button class="btn-text" id="clearLogsBtn">Clear Logs</button>
+            </div>
+            <pre class="log-output" id="logOutput">System initialized. Configure settings and click 'Start Folder Batch Scan' to begin.</pre>
+          </div>
+        </div>
+
+        <!-- Tab 2: Cut Clips Gallery -->
+        <div class="tab-content" id="galleryTab">
+          <div class="gallery-toolbar">
+            <button class="btn btn-secondary" id="refreshClipsBtn">🔄 Refresh Clips</button>
+            <span class="field-hint" id="galleryPathHint">Output folder clips</span>
+          </div>
+          <div class="clip-grid" id="clipGrid">
+            <p class="empty-msg">No cut clips found in output directory yet.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- VIEW 2: DEBUG MODEL INSPECTOR -->
+      <div class="view-section hidden" id="debugView">
+        <div class="two-column-layout">
+          <!-- Left Pane: Controls & Results -->
+          <section class="panel-card debug-controls-panel">
+            <h2 class="panel-title"><span>🔍</span> Debug Model Inspector</h2>
+
+            <div class="form-group">
+              <label for="debugVideoPath">Workstation Video File Path</label>
+              <div class="input-with-action">
+                <input type="text" id="debugVideoPath" placeholder="e.g. C:\videos\movie.mp4" value="">
+                <button class="btn btn-secondary" id="loadDebugVideoBtn">Load Video</button>
+              </div>
+              <span class="field-hint" id="debugVideoHint">Enter exact path to a video file on your computer</span>
+            </div>
+
+            <div class="form-group">
+              <label for="debugPrompt">Target Scene Prompt</label>
+              <textarea id="debugPrompt" rows="3" placeholder="Enter prompt to evaluate against current frame/timecode..."></textarea>
+            </div>
+
+            <!-- Model Settings -->
+            <div class="form-row">
+              <div class="form-group col-6">
+                <label for="debugModelSelect">Vision Model</label>
+                <select id="debugModelSelect">
+                  <option value="">Loading models...</option>
+                </select>
+              </div>
+              <div class="form-group col-6">
+                <label for="debugQuantSelect">Quantization</label>
+                <select id="debugQuantSelect">
+                  <option value="4bit" selected>4-bit NF4</option>
+                  <option value="none">Native bfloat16</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Dual Model Classification Checkbox & Text LLM Select -->
+            <div class="form-group dual-model-card">
+              <label class="checkbox-label" for="debugDualModelCheck">
+                <input type="checkbox" id="debugDualModelCheck">
+                <span class="checkbox-text">🔗 Dual Model Scene Classification</span>
+              </label>
+              <div class="text-model-group hidden" id="debugTextModelGroup">
+                <label for="debugTextModelSelect">Text LLM Classifier Model</label>
+                <select id="debugTextModelSelect">
+                  <option value="">Loading models...</option>
+                </select>
+
+                <div class="slider-group">
+                  <div class="slider-header">
+                    <label for="debugSimilarityThresholdSlider">Similarity Match Threshold</label>
+                    <span class="badge badge-gpu" id="debugSimilarityThresholdValue">50%</span>
+                  </div>
+                  <input type="range" id="debugSimilarityThresholdSlider" min="10" max="100" step="5" value="50">
+                  <span class="field-hint">Match probability % required to classify a scene as a match.</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Active Timecode & Analyze Button -->
+            <div class="timecode-card">
+              <div class="timecode-header">
+                <span>Active Timecode</span>
+                <span class="timecode-value" id="debugTimecodeLabel">00:00:00.00 (0.00s)</span>
+              </div>
+              <button class="btn btn-primary btn-lg full-width" id="analyzeFrameBtn">
+                <span>⚡</span> Analyze Current Frame / Timestamp
+              </button>
+            </div>
+
+            <!-- Analysis Output Card -->
+            <div class="debug-results-card" id="debugResultsCard">
+              <div class="results-header">
+                <span class="results-title">Model Evaluation Output</span>
+                <span class="match-badge badge-idle" id="debugMatchBadge">Not Analyzed</span>
+              </div>
+              <div class="timing-bar" id="debugTimingBar">
+                <span class="timing-tag" id="timingVisionLabel">📷 Vision Model: --s</span>
+                <span class="timing-tag" id="timingTextLabel">🧠 Text LLM: --s</span>
+                <span class="timing-tag timing-highlight" id="timingTotalLabel">⚡ Total: --s</span>
+              </div>
+              <div class="reason-box">
+                <label>Model Reasoning / Explanation:</label>
+                <pre id="debugReasonOutput" class="reason-text">Position video player to target frame/timecode and click 'Analyze Current Frame / Timestamp' to test prompt.</pre>
+              </div>
+            </div>
+          </section>
+
+          <!-- Right Pane: Video Player -->
+          <section class="panel-card debug-player-panel">
+            <h2 class="panel-title"><span>🎬</span> Video Player & Frame Seeking</h2>
+            <div class="video-player-wrapper">
+              <video id="debugVideoPlayer" controls preload="metadata"></video>
+            </div>
+            <div class="player-hints">
+              <p>💡 <strong>Use the video player controls or scrub bar</strong> to seek to any exact frame/timecode. The timecode on the left pane updates in real-time. Click <strong>Analyze Current Frame / Timestamp</strong> to send that position to Qwen2-VL!</p>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- Video Preview Modal -->
+    <div class="modal hidden" id="videoModal">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 id="modalTitle">Preview Cut Scene Clip</h3>
+          <button class="close-btn" id="closeModalBtn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <video id="modalVideoPlayer" controls autoplay></video>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Model Download Modal -->
+    <div class="modal hidden" id="addModelModal">
+      <div class="modal-backdrop" onclick="closeAddModelModal()"></div>
+      <div class="modal-content" style="max-width: 520px;">
+        <div class="modal-header">
+          <h3>➕ Download Model from HuggingFace</h3>
+          <button class="close-btn" onclick="closeAddModelModal()">&times;</button>
+        </div>
+        <div class="modal-body" style="padding: 1.5rem;">
+          <div class="form-group">
+            <label for="downloadModelId">HuggingFace Model ID</label>
+            <input type="text" id="downloadModelId" placeholder="e.g. Qwen/Qwen2.5-7B-Instruct">
+            <span class="field-hint">Paste the full model ID from huggingface.co (e.g. org/model-name)</span>
+          </div>
+          <div class="form-group">
+            <label for="downloadModelType">Model Type</label>
+            <select id="downloadModelType">
+              <option value="text">Text LLM (for scene matching/reasoning)</option>
+              <option value="vision">Vision LLM (for scene captioning)</option>
+            </select>
+            <span class="field-hint">This helps classify the model in the correct dropdown after download.</span>
+          </div>
+          <div id="downloadStatus" style="display: none; margin-bottom: 1rem;">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+              <span class="badge badge-processing" id="downloadStatusBadge">Downloading...</span>
+              <span id="downloadStatusMsg" class="field-hint"></span>
+            </div>
+          </div>
+          <div class="form-row flex-end">
+            <button class="btn btn-secondary" onclick="closeAddModelModal()">Cancel</button>
+            <button class="btn btn-primary" id="downloadModelBtn" onclick="downloadModel()">
+              <span class="icon">⬇️</span> Download Model
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

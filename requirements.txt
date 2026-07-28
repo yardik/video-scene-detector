@@ -1,0 +1,29 @@
+# ── Core inference ──
+torch
+torchvision
+transformers>=4.45.0
+accelerate
+safetensors
+bitsandbytes            # 4-bit NF4 quantization
+huggingface_hub         # model download / snapshot_download
+qwen-vl-utils           # Qwen2-VL / Qwen2.5-VL vision preprocessing
+
+# ── Video / imaging ──
+opencv-python
+av
+imageio-ffmpeg          # bundled ffmpeg binary for lossless clip cutting
+pillow
+numpy
+
+# ── Web client (cli.py --web) ──
+fastapi
+uvicorn
+pydantic
+
+# ── Misc ──
+tqdm
+
+# ── Optional ──
+# gradio                # only needed for the legacy app.py UI
+# sageattention         # --sage-attn INT8 attention kernels
+# flash-attn            # auto-detected; falls back to PyTorch SDPA
