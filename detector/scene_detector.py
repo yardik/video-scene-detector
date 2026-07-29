@@ -651,6 +651,10 @@ class VideoSceneDetector:
                     pop_wait_sec = time.time() - t_pop0
                     extract_dur = prepared_data.get("_extraction_duration", 0.0)
 
+                    if next_idx < len(windows):
+                        pending.append(executor.submit(_prep_window, windows[next_idx]))
+                        next_idx += 1
+
                     if idx == 1:
                         initial_setup_sec = pop_wait_sec
                     else:
