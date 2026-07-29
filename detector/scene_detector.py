@@ -977,6 +977,7 @@ class VideoSceneDetector:
         span_end: float,
         duration_sec: float,
         tracker: Optional[ExecutionTracker] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> float:
         """Binary search for exact scene start within the first YES sub-window."""
         def log_msg(msg: str):
@@ -995,6 +996,8 @@ class VideoSceneDetector:
 
         step = 0
         while hi - lo > self.FINE_PRECISION_SEC:
+            if is_cancelled and is_cancelled():
+                raise InterruptedError("Operation cancelled by user")
             mid = (lo + hi) / 2.0
             if mid - lo < self.FINE_MIN_SEGMENT_SEC:
                 break
@@ -1034,6 +1037,7 @@ class VideoSceneDetector:
         span_end: float,
         duration_sec: float,
         tracker: Optional[ExecutionTracker] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> float:
         """Binary search for exact scene end within the last YES sub-window."""
         def log_msg(msg: str):
@@ -1052,6 +1056,8 @@ class VideoSceneDetector:
 
         step = 0
         while hi - lo > self.FINE_PRECISION_SEC:
+            if is_cancelled and is_cancelled():
+                raise InterruptedError("Operation cancelled by user")
             mid = (lo + hi) / 2.0
             if hi - mid < self.FINE_MIN_SEGMENT_SEC:
                 break
