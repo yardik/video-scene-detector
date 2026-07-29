@@ -4,7 +4,7 @@ import json
 import time
 import gc
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Callable
 import logging
 
 import torch
