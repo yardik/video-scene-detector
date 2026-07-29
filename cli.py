@@ -12,6 +12,7 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from detector import VideoSceneDetector, BatchProcessor
+from detector.qwen_model import IMAGE_ONLY_MICRO_BATCH_SIZE
 
 
 def main():
@@ -68,16 +69,32 @@ def main():
         help="Coarse scan window length in minutes (range: 1.0 to 5.0, default: 2.0)",
     )
     parser.add_argument(
-        "--coarse-frames", type=int, default=64,
-        help="Number of frames sampled across each coarse window (range: 8 to 64, default: 64)",
+        "--coarse-frames", type=int, default=16,
+        help="Number of frames sampled across each coarse window (range: 8 to 64, default: 16)",
     )
     parser.add_argument(
         "--smart-motion", action="store_true",
         help="Enable Smart Motion Keyframe Sampling (filters out duplicate static frames before VLM inference)",
     )
     parser.add_argument(
-        "--sage-attn", action="store_true",
-        help="Enable SageAttention 2 INT8 Acceleration (NHD contiguous layout)",
+        "--sage-attn", dest="sage_attn", action="store_true", default=True,
+        help="Enable SageAttention 2 INT8 Acceleration (NHD contiguous layout) (default: on)",
+    )
+    parser.add_argument(
+        "--no-sage-attn", dest="sage_attn", action="store_false",
+        help="Disable SageAttention 2 and use native PyTorch SDPA instead",
+    )
+    parser.add_argument(
+        "--image-only-micro-batch", type=int, default=IMAGE_ONLY_MICRO_BATCH_SIZE,
+        help="Frames processed concurrently per generate() call for single-image "
+             f"(non video-native) vision models — lower to reduce VRAM use at the cost of "
+             f"wall-clock time (default: {IMAGE_ONLY_MICRO_BATCH_SIZE}). No effect on "
+             "video-native models.",
+    )
+    parser.add_argument(
+        "--text-llm-batch", type=int, default=10,
+        help="Number of scene descriptions processed concurrently during Text LLM classification "
+             "in micro-batches (1 to 16, default: 10). Lower to reduce peak memory usage.",
     )
     parser.add_argument(
         "--start-time", "--start", default=None,
@@ -129,6 +146,9 @@ def main():
             similarity_threshold=args.similarity_threshold,
             coarse_window_minutes=args.coarse_window_min,
             coarse_frames=args.coarse_frames,
+            use_sage_attention=args.sage_attn,
+            image_only_micro_batch_size=args.image_only_micro_batch,
+            text_llm_batch_size=args.text_llm_batch,
         )
         
         processor.process_batch(
@@ -150,6 +170,8 @@ def main():
             coarse_window_minutes=args.coarse_window_min,
             coarse_frames=args.coarse_frames,
             use_sage_attention=args.sage_attn,
+            image_only_micro_batch_size=args.image_only_micro_batch,
+            text_llm_batch_size=args.text_llm_batch,
         )
 
         scenes = detector.detect_scenes(

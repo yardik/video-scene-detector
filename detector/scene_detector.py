@@ -2,12 +2,21 @@ import sys
 import os
 import json
 import time
+import gc
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, Optional, List, Tuple
 import logging
 
+import torch
+
 from .video_utils import VideoUtils
-from .qwen_model import QwenVLModel, DEFAULT_MODEL_ID, DEFAULT_MAX_VIDEO_PIXELS, MAX_TARGET_FRAMES, get_cached_qwen_model
+from .qwen_model import (
+    DEFAULT_MODEL_ID,
+    DEFAULT_MAX_VIDEO_PIXELS,
+    MAX_TARGET_FRAMES,
+    IMAGE_ONLY_MICRO_BATCH_SIZE,
+    get_cached_qwen_model,
+)
 from .text_llm import TextLLMClassifier, DEFAULT_TEXT_MODEL_ID, get_cached_text_llm
 
 logger = logging.getLogger(__name__)
@@ -75,7 +84,6 @@ class VideoSceneDetector:
     MEDIUM_FRAMES = 16            # 16 frames across 30s (~0.8s per sub-window)
     MEDIUM_MAX_PIXELS = 100_352   # ~316x316 — sharp facial detail
 
-    # ── Phase 3: Fine Boundary Search Parameters (Pass 3) ──
     FINE_PRECISION_SEC = 4.0      # Binary search stops at 4s precision
     FINE_FRAMES = 12              # 12 frames for binary search steps
     FINE_MAX_PIXELS = 80_000      # ~282x282
@@ -92,15 +100,18 @@ class VideoSceneDetector:
         text_model_name: Optional[str] = DEFAULT_TEXT_MODEL_ID,
         similarity_threshold: float = 50.0,
         coarse_window_minutes: float = 2.0,
-        coarse_frames: int = 64,
+        coarse_frames: int = 16,
         smart_motion_sampling: bool = False,
-        use_sage_attention: bool = False,
+        use_sage_attention: bool = True,
+        image_only_micro_batch_size: int = IMAGE_ONLY_MICRO_BATCH_SIZE,
+        text_llm_batch_size: int = 10,
     ):
         self.dual_model = dual_model
         self.text_model_name = text_model_name
         self.similarity_threshold = similarity_threshold
         self.smart_motion_sampling = smart_motion_sampling
         self.use_sage_attention = use_sage_attention
+        self.text_llm_batch_size = max(1, text_llm_batch_size)
 
         # Bounded Coarse Scan Parameters (Min 1.0m, Max 5.0m; Min 8 frames, Max 64 frames)
         bounded_min = max(1.0, min(5.0, coarse_window_minutes))
@@ -117,6 +128,7 @@ class VideoSceneDetector:
             uncensored=uncensored,
             quantization=quantization,
             use_sage_attention=use_sage_attention,
+            image_only_micro_batch_size=image_only_micro_batch_size,
         )
 
         self.text_llm = None
@@ -124,6 +136,7 @@ class VideoSceneDetector:
             self.text_llm = get_cached_text_llm(
                 model_name_or_path=text_model_name,
                 quantization=quantization,
+                use_sage_attention=use_sage_attention,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -142,6 +155,9 @@ class VideoSceneDetector:
     ) -> Tuple[bool, str]:
         """Evaluates a single condition using either single Qwen2-VL or Dual-Model pipeline."""
         if self.dual_model and self.text_llm:
+            if self.text_llm.is_loaded:
+                self.text_llm.unload()
+
             t0 = time.time()
             description = self.model.describe_scene(
                 video_path,
@@ -154,6 +170,8 @@ class VideoSceneDetector:
             dt_vision = time.time() - t0
             if tracker:
                 tracker.vision_inference_sec += dt_vision
+
+            self.model.unload()
 
             t0 = time.time()
             is_match, reason = self.text_llm.classify_description(
@@ -276,6 +294,27 @@ class VideoSceneDetector:
 
         return summary_path
 
+    @staticmethod
+    def _release_cuda_cache(tracker: Optional[ExecutionTracker] = None):
+        """
+        Returns unused cached VRAM to the driver once a video finishes processing.
+        Model weights stay resident (get_cached_qwen_model/get_cached_text_llm keep them
+        loaded for fast reuse on the next video) — this only clears the allocator's
+        cached-but-unused blocks, which otherwise linger at whatever the run's peak
+        batch size was and show up as "still using memory" in nvidia-smi/Task Manager.
+        """
+        gc.collect()
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.empty_cache()
+        allocated_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+        msg = f"🧹 Released cached VRAM (Active: {allocated_mb:.0f} MB | Reserved: {reserved_mb:.0f} MB)"
+        if tracker:
+            tracker.log(msg)
+        else:
+            print(msg, file=sys.stderr)
+
     # ══════════════════════════════════════════════════════════════════════
     # Public API
     # ══════════════════════════════════════════════════════════════════════
@@ -288,14 +327,44 @@ class VideoSceneDetector:
         clip_output_dir: Optional[str] = None,
         start_time: Optional[Any] = None,
         end_time: Optional[Any] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[SceneMatch]:
         """
         Finds ALL scenes in the video matching the prompt.
         Returns a list of SceneMatch objects with precise boundaries.
+
+        Guarantees cached-but-unused VRAM is released (see _release_cuda_cache) whether
+        this completes normally or raises partway through — a crash mid-run (bad video file,
+        an OOM, any bug) is exactly when leftover reserved memory would otherwise compound
+        across subsequent runs in the same process.
         """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
+        try:
+            return self._detect_scenes_impl(
+                video_path, prompt,
+                cut_clips=cut_clips,
+                clip_output_dir=clip_output_dir,
+                start_time=start_time,
+                end_time=end_time,
+                is_cancelled=is_cancelled,
+            )
+        finally:
+            self._release_cuda_cache()
+            from .qwen_model import clear_video_capture_cache
+            clear_video_capture_cache()
+
+    def _detect_scenes_impl(
+        self,
+        video_path: str,
+        prompt: str,
+        cut_clips: bool = False,
+        clip_output_dir: Optional[str] = None,
+        start_time: Optional[Any] = None,
+        end_time: Optional[Any] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> List[SceneMatch]:
         tracker = ExecutionTracker()
         log = tracker.log
 
@@ -321,7 +390,7 @@ class VideoSceneDetector:
         p1_start = time.time()
         coarse_results = self._coarse_scan(
             video_path, conditions, duration_sec, tracker=tracker,
-            start_sec=start_sec, end_sec=end_sec
+            start_sec=start_sec, end_sec=end_sec, is_cancelled=is_cancelled,
         )
         coarse_regions = self._merge_hits(coarse_results)
         p1_time = time.time() - p1_start
@@ -337,6 +406,10 @@ class VideoSceneDetector:
                 log(f"       Region {i}: {VideoUtils.format_timestamp(rs)} → {VideoUtils.format_timestamp(re)} ({re - rs:.0f}s)")
         log(f"{'='*70}\n")
 
+        # Phase 1 can run large batches; release before Phase 2 starts so its peak
+        # doesn't compound on top of Phase 1's leftover reserved memory.
+        self._release_cuda_cache(tracker)
+
         if not coarse_regions:
             elapsed = time.time() - pipeline_start
             log(f"\n❌ No matching scenes found satisfying ALL conditions. (Total: {elapsed:.1f}s)")
@@ -345,7 +418,7 @@ class VideoSceneDetector:
 
         # ── Phase 2: Global Medium Scan ──
         p2_start = time.time()
-        all_region_medium_results = self._medium_scan_all_regions(video_path, conditions, coarse_regions, tracker=tracker)
+        all_region_medium_results = self._medium_scan_all_regions(video_path, conditions, coarse_regions, tracker=tracker, is_cancelled=is_cancelled)
         p2_time = time.time() - p2_start
 
         all_medium_spans: List[Tuple[float, float]] = []
@@ -367,6 +440,9 @@ class VideoSceneDetector:
             for i, (ss, se) in enumerate(all_medium_spans, 1):
                 log(f"       Span {i}: {VideoUtils.format_timestamp(ss)} → {VideoUtils.format_timestamp(se)} ({se - ss:.0f}s)")
         log(f"{'='*70}\n")
+
+        # Release before Phase 3's many small binary-search steps begin.
+        self._release_cuda_cache(tracker)
 
         if not all_medium_spans:
             elapsed = time.time() - pipeline_start
@@ -390,10 +466,10 @@ class VideoSceneDetector:
 
                 # ── Phase 3: Binary search for exact boundaries ──
                 exact_start = self._find_start_boundary(
-                    video_path, conditions, span_start, span_end, duration_sec, tracker=tracker
+                    video_path, conditions, span_start, span_end, duration_sec, tracker=tracker, is_cancelled=is_cancelled,
                 )
                 exact_end = self._find_end_boundary(
-                    video_path, conditions, span_start, span_end, duration_sec, tracker=tracker
+                    video_path, conditions, span_start, span_end, duration_sec, tracker=tracker, is_cancelled=is_cancelled,
                 )
 
                 if exact_end <= exact_start:
@@ -504,6 +580,7 @@ class VideoSceneDetector:
         tracker: Optional[ExecutionTracker] = None,
         start_sec: float = 0.0,
         end_sec: Optional[float] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[Tuple[float, float, bool]]:
         """
         Scans video with 3-min sliding windows using primary action condition (C1).
@@ -532,9 +609,15 @@ class VideoSceneDetector:
         if self.dual_model and self.text_llm and len(windows) > 1:
             descriptions = []
             log_msg(f"  🎥 Step 1/2: Extracting scene descriptions across {len(windows)} coarse windows (Async CPU Prefetching Active)...")
-            
+
+            # Free the text LLM's VRAM while only the vision model is needed; it lazily
+            # reloads inside classify_descriptions_batch() below.
+            self.text_llm.unload()
+            if not self.model.is_loaded:
+                self.model.load_model()
+
             from concurrent.futures import ThreadPoolExecutor
-            
+
             unoverlapped_extract_sec = 0.0
             masked_extract_sec = 0.0
 
@@ -551,16 +634,24 @@ class VideoSceneDetector:
                 data["_extraction_duration"] = time.time() - t_ext0
                 return data
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                future_next = executor.submit(_prep_window, windows[0])
+            from collections import deque
+            PREFETCH_DEPTH = 2
+            with ThreadPoolExecutor(max_workers=PREFETCH_DEPTH + 1) as executor:
+                pending = deque(
+                    executor.submit(_prep_window, w)
+                    for w in windows[:PREFETCH_DEPTH]
+                )
+                next_idx = PREFETCH_DEPTH
 
                 for idx, (w_start, w_end) in enumerate(windows, 1):
-                    t0 = time.time()
-                    prepared_data = future_next.result()
+                    if is_cancelled and is_cancelled():
+                        raise InterruptedError("Operation cancelled by user")
+                    prepared_data = pending.popleft().result()
                     extract_dur = prepared_data.get("_extraction_duration", 0.0)
 
-                    if idx < len(windows):
-                        future_next = executor.submit(_prep_window, windows[idx])
+                    if next_idx < len(windows):
+                        pending.append(executor.submit(_prep_window, windows[next_idx]))
+                        next_idx += 1
 
                     t_gpu0 = time.time()
                     desc = self.model.describe_scene_from_inputs(prepared_data)
@@ -568,6 +659,12 @@ class VideoSceneDetector:
                     descriptions.append(desc)
                     if tracker:
                         tracker.vision_inference_sec += dt_gpu
+
+                    if "input_chunks" in prepared_data and prepared_data["input_chunks"] is not None:
+                        prepared_data["input_chunks"].clear()
+                    if "image_inputs" in prepared_data and prepared_data["image_inputs"] is not None:
+                        prepared_data["image_inputs"].clear()
+                    del prepared_data
 
                     if idx == 1:
                         unoverlapped_extract_sec += extract_dur
@@ -578,12 +675,15 @@ class VideoSceneDetector:
                             unoverlapped_extract_sec += (extract_dur - dt_gpu)
                             masked_extract_sec += dt_gpu
 
-                    log_msg(f"    [Vision Desc {idx}/{len(windows)}] [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] (GPU: {dt_gpu:.1f}s | Extract Lost: {unoverlapped_extract_sec:.2f}s): {desc[:80]}...")
+                    log_msg(f"    [Vision Desc {idx}/{len(windows)}] [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] (GPU: {dt_gpu:.1f}s | Extract Lost: {unoverlapped_extract_sec:.2f}s):\n{desc}")
 
             if tracker:
                 tracker.active_frame_extract_sec += unoverlapped_extract_sec
 
             log_msg(f"  ⏱️ Frame Extraction Timing Metrics: Un-overlapped Lost Time: {unoverlapped_extract_sec:.2f}s | GPU-Masked Time: {masked_extract_sec:.2f}s")
+
+            # Unload video vision model entirely before doing text LLM classification
+            self.model.unload()
 
             log_msg(f"\n  🧠 Step 2/2: Batch evaluating Text LLM similarity ({len(windows)} descriptions in parallel)...")
             t_batch0 = time.time()
@@ -591,10 +691,13 @@ class VideoSceneDetector:
                 descriptions,
                 [primary_condition] * len(windows),
                 threshold=self.similarity_threshold,
+                batch_size=self.text_llm_batch_size,
             )
             dt_batch = time.time() - t_batch0
             if tracker:
                 tracker.llm_inference_sec += dt_batch
+
+            self.text_llm.unload()
 
             log_msg(f"  ⚡ Parallel Text LLM batch classification complete in {dt_batch:.2f}s ({dt_batch/len(windows):.2f}s avg/window)!\n")
 
@@ -644,6 +747,7 @@ class VideoSceneDetector:
         conditions: List[str],
         coarse_regions: List[Tuple[float, float]],
         tracker: Optional[ExecutionTracker] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[List[Tuple[float, float, bool]]]:
         """Subdivides all coarse hit regions into 30-sec sub-windows evaluating sub-conditions in a single global batch."""
         def log_msg(msg: str):
@@ -667,6 +771,13 @@ class VideoSceneDetector:
             descriptions = []
             log_msg(f"  🎥 Extracting {len(all_windows)} sub-window descriptions (Async CPU Prefetching Active)...")
 
+            # Free the text LLM's VRAM while only the vision model is needed; it lazily
+            # reloads inside classify_descriptions_batch() below.
+            self.text_llm.unload()
+            if not self.model.is_loaded:
+                self.model.load_model()
+
+            from collections import deque
             from concurrent.futures import ThreadPoolExecutor
 
             def _prep_sub_window(w):
@@ -679,12 +790,24 @@ class VideoSceneDetector:
                     smart_motion_sampling=self.smart_motion_sampling,
                 )
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                future_next = executor.submit(_prep_sub_window, all_windows[0])
+            # Keep PREFETCH_DEPTH sub-windows' frames being extracted on CPU threads
+            # ahead of the one currently running GPU inference, so a slow extraction
+            # (e.g. a window needing a big seek) has more than one window's worth of
+            # GPU compute time to hide behind before it can stall the pipeline.
+            PREFETCH_DEPTH = 2
+            with ThreadPoolExecutor(max_workers=PREFETCH_DEPTH + 1) as executor:
+                pending = deque(
+                    executor.submit(_prep_sub_window, w)
+                    for w in all_windows[:PREFETCH_DEPTH]
+                )
+                next_idx = PREFETCH_DEPTH
                 for idx, item in enumerate(all_windows, 1):
-                    prepared_data = future_next.result()
-                    if idx < len(all_windows):
-                        future_next = executor.submit(_prep_sub_window, all_windows[idx])
+                    if is_cancelled and is_cancelled():
+                        raise InterruptedError("Operation cancelled by user")
+                    prepared_data = pending.popleft().result()
+                    if next_idx < len(all_windows):
+                        pending.append(executor.submit(_prep_sub_window, all_windows[next_idx]))
+                        next_idx += 1
 
                     t_gpu0 = time.time()
                     desc = self.model.describe_scene_from_inputs(prepared_data)
@@ -692,6 +815,16 @@ class VideoSceneDetector:
                     descriptions.append(desc)
                     if tracker:
                         tracker.vision_inference_sec += dt_gpu
+                    log_msg(f"    [Vision Desc {idx}/{len(all_windows)}] [{VideoUtils.format_timestamp(all_windows[idx-1][1])}..{VideoUtils.format_timestamp(all_windows[idx-1][2])}] (GPU: {dt_gpu:.1f}s):\n{desc}")
+
+                    if "input_chunks" in prepared_data and prepared_data["input_chunks"] is not None:
+                        prepared_data["input_chunks"].clear()
+                    if "image_inputs" in prepared_data and prepared_data["image_inputs"] is not None:
+                        prepared_data["image_inputs"].clear()
+                    del prepared_data
+
+            # Unload video vision model entirely before doing text LLM classification
+            self.model.unload()
 
             log_msg(f"  🧠 Batch evaluating Text LLM similarity ({len(all_windows)} sub-windows)...")
             t_llm0 = time.time()
@@ -699,16 +832,19 @@ class VideoSceneDetector:
                 descriptions,
                 [conditions[0]] * len(all_windows),
                 threshold=self.similarity_threshold,
+                batch_size=self.text_llm_batch_size,
             )
             dt_llm = time.time() - t_llm0
             if tracker:
                 tracker.llm_inference_sec += dt_llm
 
+            self.text_llm.unload()
+
             region_results: List[List[Tuple[float, float, bool]]] = [[] for _ in coarse_regions]
             for (r_idx, w_s, w_e), (detected, reason) in zip(all_windows, classified):
                 clean_reason = reason.replace("\n", " ")
                 tag = "YES ✓" if detected else "NO"
-                log_msg(f"    Region {r_idx+1} Sub [{VideoUtils.format_timestamp(w_s)}..{VideoUtils.format_timestamp(w_e)}] → {tag} | Reason: {clean_reason[:80]}...")
+                log_msg(f"    Region {r_idx+1} Sub [{VideoUtils.format_timestamp(w_s)}..{VideoUtils.format_timestamp(w_e)}] → {tag} | Reason: {clean_reason}")
                 region_results[r_idx].append((w_s, w_e, detected))
 
             return region_results
@@ -741,27 +877,62 @@ class VideoSceneDetector:
 
         if self.dual_model and self.text_llm and len(windows) > 1:
             descriptions = []
-            for idx, (w_start, w_end) in enumerate(windows, 1):
-                t0 = time.time()
-                desc = self.model.describe_scene(
+            if not self.model.is_loaded:
+                self.model.load_model()
+
+            from collections import deque
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _prep_medium_window(w):
+                return self.model.prepare_describe_inputs(
                     video_path,
-                    video_start=w_start,
-                    video_end=w_end,
+                    video_start=w[0],
+                    video_end=w[1],
                     max_frames=self.MEDIUM_FRAMES,
                     max_pixels=self.MEDIUM_MAX_PIXELS,
+                    smart_motion_sampling=self.smart_motion_sampling,
                 )
-                descriptions.append(desc)
-                if tracker:
-                    tracker.vision_inference_sec += (time.time() - t0)
+
+            PREFETCH_DEPTH = 2
+            with ThreadPoolExecutor(max_workers=PREFETCH_DEPTH + 1) as executor:
+                pending = deque(
+                    executor.submit(_prep_medium_window, w)
+                    for w in windows[:PREFETCH_DEPTH]
+                )
+                next_idx = PREFETCH_DEPTH
+                for idx, (w_start, w_end) in enumerate(windows, 1):
+                    prepared_data = pending.popleft().result()
+                    if next_idx < len(windows):
+                        pending.append(executor.submit(_prep_medium_window, windows[next_idx]))
+                        next_idx += 1
+
+                    t0 = time.time()
+                    desc = self.model.describe_scene_from_inputs(prepared_data)
+                    dt_gpu = time.time() - t0
+                    descriptions.append(desc)
+                    if tracker:
+                        tracker.vision_inference_sec += dt_gpu
+
+                    if "input_chunks" in prepared_data and prepared_data["input_chunks"] is not None:
+                        prepared_data["input_chunks"].clear()
+                    if "image_inputs" in prepared_data and prepared_data["image_inputs"] is not None:
+                        prepared_data["image_inputs"].clear()
+                    del prepared_data
+
+            # Unload video vision model entirely before doing text LLM classification
+            self.model.unload()
 
             t0 = time.time()
             classified = self.text_llm.classify_descriptions_batch(
                 descriptions,
                 [conditions[0]] * len(windows),
                 threshold=self.similarity_threshold,
+                batch_size=self.text_llm_batch_size,
             )
             if tracker:
                 tracker.llm_inference_sec += (time.time() - t0)
+
+            self.text_llm.unload()
 
             results = []
             for (w_start, w_end), (detected, reason) in zip(windows, classified):

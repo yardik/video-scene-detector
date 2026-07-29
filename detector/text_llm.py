@@ -19,7 +19,7 @@ SUGGESTED_TEXT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_TEXT_MODEL_ID = None
 
 _cached_text_model_instance: Optional["TextLLMClassifier"] = None
-_cached_text_model_key: Optional[Tuple[str, Optional[str]]] = None
+_cached_text_model_key: Optional[Tuple[str, Optional[str], bool]] = None
 
 
 class TextLLMClassifier:
@@ -30,18 +30,48 @@ class TextLLMClassifier:
         model_name_or_path: Optional[str] = DEFAULT_TEXT_MODEL_ID,
         quantization: Optional[str] = "4bit",
         device: str = "auto",
+        use_sage_attention: bool = True,
     ):
         self.model_name_or_path = model_name_or_path
         self.quantization = quantization
         self.device = device
+        self.use_sage_attention = use_sage_attention
         self.model = None
         self.tokenizer = None
         self.is_loaded = False
+        import threading
+        self._load_lock = threading.Lock()
+
+    def unload(self):
+        """
+        Frees GPU VRAM by dropping the model and tokenizer. Any subsequent classify_*
+        call auto-reloads via its existing `if not self.is_loaded: self.load_model()` guard —
+        callers don't need to call load_model() explicitly afterward.
+        """
+        with self._load_lock:
+            if not self.is_loaded:
+                return
+            print(f"💤 Unloading Text LLM from VRAM...", file=sys.stderr)
+            if self.model is not None:
+                del self.model
+                self.model = None
+            if self.tokenizer is not None:
+                del self.tokenizer
+                self.tokenizer = None
+            self.is_loaded = False
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def load_model(self):
         """Loads the text model and tokenizer into GPU memory."""
-        if self.is_loaded:
-            return
+        with self._load_lock:
+            if self.is_loaded:
+                return
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         from .video_utils import resolve_model_path
         self.model_name_or_path = resolve_model_path(self.model_name_or_path)
@@ -49,13 +79,17 @@ class TextLLMClassifier:
         print(f"📦 Loading Text LLM: {self.model_name_or_path} (Quant: {self.quantization})...", file=sys.stderr)
 
         attn_impl = "sdpa"
-        try:
-            import flash_attn
-            attn_impl = "flash_attention_2"
-            print("⚡ [Text LLM] FlashAttention-2 active!", file=sys.stderr)
-        except ImportError:
-            attn_impl = "sdpa"
-            print("⚡ [Text LLM] PyTorch Native SDPA (Scaled Dot-Product Attention) active on Tensor Cores.", file=sys.stderr)
+        if self.use_sage_attention:
+            from .sage_patcher import enable_sage_attention
+            enable_sage_attention()
+        else:
+            try:
+                import flash_attn
+                attn_impl = "flash_attention_2"
+                print("⚡ [Text LLM] FlashAttention-2 active!", file=sys.stderr)
+            except ImportError:
+                attn_impl = "sdpa"
+                print("⚡ [Text LLM] PyTorch Native SDPA (Scaled Dot-Product Attention) active on Tensor Cores.", file=sys.stderr)
 
         kwargs = {
             "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
@@ -179,9 +213,9 @@ class TextLLMClassifier:
         descriptions: List[str],
         target_prompts: List[str],
         threshold: float = 80.0,
-        batch_size: int = 16,
+        batch_size: int = 4,
     ) -> List[Tuple[bool, str]]:
-        """Batch evaluates multiple (description, target_prompt) pairs in micro-batches (default 16)
+        """Batch evaluates multiple (description, target_prompt) pairs in micro-batches (default 4)
         to maintain minimal VRAM usage while achieving maximum GPU parallel speedup.
 
         Returns:
@@ -252,6 +286,11 @@ class TextLLMClassifier:
             ]
             decoded_responses = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
+            del inputs, generated_ids, output_ids, formatted_prompts
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             for response_text in decoded_responses:
                 response_text = response_text.strip()
                 prob_val = 0.0
@@ -275,10 +314,6 @@ class TextLLMClassifier:
                 full_reasoning = f"{summary_header}\n\n{response_text}"
                 all_results.append((is_match, full_reasoning))
 
-            del inputs, generated_ids
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
         return all_results
 
 
@@ -286,6 +321,7 @@ class TextLLMClassifier:
 def get_cached_text_llm(
     model_name_or_path: Optional[str] = DEFAULT_TEXT_MODEL_ID,
     quantization: Optional[str] = "4bit",
+    use_sage_attention: bool = True,
 ) -> TextLLMClassifier:
     """
     Returns a cached TextLLMClassifier instance, re-loading only if settings change.
@@ -306,7 +342,7 @@ def get_cached_text_llm(
             )
         print(f"⚡ No text model specified — using first installed model: '{model_name_or_path}'", file=sys.stderr)
 
-    current_key = (model_name_or_path, quantization)
+    current_key = (model_name_or_path, quantization, use_sage_attention)
 
     if (
         _cached_text_model_instance is not None
@@ -332,8 +368,9 @@ def get_cached_text_llm(
     instance = TextLLMClassifier(
         model_name_or_path=model_name_or_path,
         quantization=quantization,
+        use_sage_attention=use_sage_attention,
     )
-    instance.load_model()
+    # Lazy loading: model weights will be loaded when classify_descriptions_batch() is called.
 
     _cached_text_model_instance = instance
     _cached_text_model_key = current_key

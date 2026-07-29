@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Any, Optional, List, Callable, Tuple
 
 from .scene_detector import VideoSceneDetector, SceneMatch
+from .qwen_model import IMAGE_ONLY_MICRO_BATCH_SIZE
 from .video_utils import VideoUtils
 
 logger = logging.getLogger(__name__)
@@ -52,9 +53,11 @@ class BatchProcessor:
         text_model_name: Optional[str] = None,
         similarity_threshold: float = 50.0,
         coarse_window_minutes: float = 3.0,
-        coarse_frames: int = 64,
+        coarse_frames: int = 16,
         smart_motion_sampling: bool = False,
-        use_sage_attention: bool = False,
+        use_sage_attention: bool = True,
+        image_only_micro_batch_size: int = IMAGE_ONLY_MICRO_BATCH_SIZE,
+        text_llm_batch_size: int = 10,
     ):
         self.detector = VideoSceneDetector(
             model_name_or_path=model_name_or_path,
@@ -66,6 +69,8 @@ class BatchProcessor:
             coarse_frames=coarse_frames,
             smart_motion_sampling=smart_motion_sampling,
             use_sage_attention=use_sage_attention,
+            image_only_micro_batch_size=image_only_micro_batch_size,
+            text_llm_batch_size=text_llm_batch_size,
         )
         self._cancel_requested = False
 
@@ -173,6 +178,7 @@ class BatchProcessor:
                     prompt=prompt,
                     cut_clips=True,
                     clip_output_dir=output_dir,
+                    is_cancelled=lambda: self._cancel_requested,
                 )
 
                 total_scenes_found += len(scenes)
@@ -194,6 +200,16 @@ class BatchProcessor:
                             log_fn(f"   Clip: {s.clip_path}")
                 else:
                     log_fn(f"ℹ️ No matching scenes found in {video_name}")
+
+            except InterruptedError:
+                progress.status = "stopped"
+                log_fn("🛑 Batch scan stopped by user.")
+                self.detector.model.unload()
+                if self.detector.text_llm:
+                    self.detector.text_llm.unload()
+                from .qwen_model import clear_video_capture_cache
+                clear_video_capture_cache()
+                break
 
             except Exception as e:
                 logger.error(f"Error processing video {video_path}: {e}")

@@ -111,9 +111,9 @@
           <div class="form-group col-6">
             <div class="slider-header">
               <label for="coarseFramesSlider">Sampled Frames per Window</label>
-              <span class="badge badge-gpu" id="coarseFramesValue">64 frames</span>
+              <span class="badge badge-gpu" id="coarseFramesValue">16 frames</span>
             </div>
-            <input type="range" id="coarseFramesSlider" min="8" max="64" step="4" value="64">
+            <input type="range" id="coarseFramesSlider" min="8" max="64" step="4" value="16">
             <span class="field-hint">Number of frames sampled across window (8 to 64 frames).</span>
           </div>
         </div>
@@ -154,10 +154,30 @@
         <!-- SageAttention 2 Checkbox -->
         <div class="form-group dual-model-card">
           <label class="checkbox-label" for="sageAttnCheck">
-            <input type="checkbox" id="sageAttnCheck">
+            <input type="checkbox" id="sageAttnCheck" checked>
             <span class="checkbox-text">🚀 SageAttention 2 INT8 Acceleration</span>
           </label>
-          <span class="field-hint">Uses SageAttention 2 Triton kernel with NHD contiguous tensor layout (Disabled by default).</span>
+          <span class="field-hint">Uses SageAttention 2 Triton kernel with NHD contiguous tensor layout (Enabled by default).</span>
+        </div>
+
+        <!-- Image-Only Model Micro-Batch Size -->
+        <div class="form-group dual-model-card">
+          <div class="slider-header">
+            <label for="microBatchSlider">Image-Only Model Micro-Batch Size</label>
+            <span class="badge badge-gpu" id="microBatchValue">64 frames</span>
+          </div>
+          <input type="range" id="microBatchSlider" min="1" max="64" step="1" value="64">
+          <span class="field-hint">Frames encoded concurrently per GPU generation call for image-only vision models. Upper-bounded by Sampled Frames per Window (defaults to same size; lower to reduce peak VRAM use).</span>
+        </div>
+
+        <!-- Text LLM Micro-Batch Size -->
+        <div class="form-group dual-model-card">
+          <div class="slider-header">
+            <label for="textLlmBatchSlider">Text LLM Micro-Batch Size</label>
+            <span class="badge badge-gpu" id="textLlmBatchValue">10 items</span>
+          </div>
+          <input type="range" id="textLlmBatchSlider" min="1" max="16" step="1" value="10">
+          <span class="field-hint">Number of scene descriptions evaluated concurrently during Text LLM classification micro-batches (1 to 16, defaults to 10; lower to reduce peak memory usage).</span>
         </div>
 
         <!-- System Prompts Editor Panel -->

@@ -55,17 +55,10 @@ true multi-frame video or a batch of individual frames is decided by inspecting 
 - If the processor accepts a `video_processor` argument (Qwen2-VL/2.5-VL/3-VL, VideoLlava,
   LLaVA-NeXT-Video, InternVL, …), the whole window is passed through as native video.
 - Otherwise (plain LLaVA, LLaVA-NeXT, and other single-image architectures) frames are
-  sampled and captioned as a **batch** — up to `IMAGE_ONLY_BATCH_FRAMES` (8 by default) frames
-  per window, each captioned independently in one batched `generate()` call, then fused into a
-  single temporally-ordered description (`[t=12.3s] ...`) so the matcher downstream sees the
+  sampled across the window (matching the phase's requested frame count), then split into
+  micro-batches (up to `--image-only-micro-batch`, default 6) to cap peak VRAM. The outputs are
+  fused into a single temporally-ordered description (`[t=12.3s] ...`) so the matcher downstream sees the
   same one-description-per-window shape regardless of which path produced it.
-
-Batching trades VRAM for wall-clock time: each frame's activations are held concurrently during
-the batched forward pass, so memory scales with batch size, while generation time stays close to
-1× since encoding parallelizes across the batch (only autoregressive decoding stays sequential
-per frame). `IMAGE_ONLY_BATCH_FRAMES` bounds that memory cost independently of how many frames a
-given phase asks for — Phase 1 requests 64 frames per window, but an image-only model still only
-batches 8 of them.
 
 ## Requirements
 
@@ -163,13 +156,14 @@ nothing of that type is installed yet, the command exits with an error suggestin
 | `--dual-model` / `--single-model` | dual | Two-stage caption→match, or direct YES/NO from the vision model |
 | `--similarity-threshold`, `--threshold` | `50.0` | Match probability % required to count as a hit |
 | `--coarse-window-min` | `2.0` | Phase 1 window length in minutes (clamped 1.0–5.0) |
-| `--coarse-frames` | `64` | Frames sampled per coarse window (clamped 8–64) |
+| `--coarse-frames` | `16` | Frames sampled per coarse window (clamped 8–64) |
 | `--start-time`, `--start` | start of video | Restrict search — `00:01:30` or `90.0` |
 | `--end-time`, `--end` | end of video | Restrict search |
 | `--cut-clip` | off | Extract matched scenes as MP4 (single-video mode; batch always cuts) |
 | `--clip-dir` | `./extracted_clips` | Where clips and logs are written |
 | `--output` | — | Write results to a JSON file (single-video mode) |
-| `--sage-attn` | off | SageAttention 2 INT8 attention kernels (requires `sageattention`) |
+| `--sage-attn` / `--no-sage-attn` | on | SageAttention 2 INT8 attention kernels (requires `sageattention`; falls back to PyTorch SDPA if not installed) |
+| `--text-llm-batch` | `10` | Scene descriptions classified concurrently per Text LLM micro-batch (clamped 1–16) |
 | `--smart-motion` | off | Reserved — see [Known limitations](#known-limitations) |
 | `--web`, `--gui` | — | Launch the web client instead of detecting |
 | `--port` | `8000` | Web client port |
@@ -318,7 +312,6 @@ Runtime scales with video length and how much of it survives Phase 1. A prompt t
 Documented honestly so you know what you're getting:
 
 - **`--smart-motion` is a no-op.** The flag is plumbed through every layer but `filter_motion_keyframes()` is never actually called.
-- **`--coarse-frames` only affects video-native models.** Image-only models always batch `IMAGE_ONLY_BATCH_FRAMES` (8) frames per window regardless of what a phase requests, to keep VRAM bounded — see [Works with any vision-language model](#works-with-any-vision-language-model).
 - **`app.py` (Gradio) is legacy.** The web client under `web/` replaced it. Its export path calls `export_json` with a single `SceneMatch` where a list is expected, so downloads from that UI will fail. Use `cli.py --web`.
 - **Boundary precision is ~4 seconds**, set by `FINE_PRECISION_SEC`. Lower it for tighter edges at the cost of more binary-search steps.
 - **Windows-first.** Paths and console encoding are handled with Windows in mind; Linux and macOS should work but are less exercised.

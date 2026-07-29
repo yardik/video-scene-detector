@@ -7,6 +7,7 @@ import time
 import inspect
 import logging
 import warnings
+import gc
 from typing import Dict, Any, Optional, List, Union, Tuple
 
 warnings.filterwarnings("ignore", message=".*inner dimension.*not aligned.*")
@@ -22,7 +23,7 @@ os.environ["TRANSFORMERS_CACHE"] = LOCAL_CACHE_DIR
 
 # Enable maximum performance flags for C++ FFmpeg timestamp seeking & NVIDIA Ada Lovelace Tensor Cores BEFORE importing torch
 os.environ["FORCE_QWENVL_VIDEO_READER"] = "torchvision"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import cv2
@@ -52,22 +53,52 @@ def print_vram_stats(tag: str = ""):
         )
 
 
+_THREAD_CAP_CACHE: Dict[Tuple[int, str], Any] = {}
+
+
+def get_video_capture(video_path: str) -> cv2.VideoCapture:
+    """
+    Returns a thread-cached open cv2.VideoCapture handle for `video_path`.
+    Prevents reopening the video file and re-parsing container stream headers on every window.
+    """
+    import threading
+    tid = threading.get_ident()
+    key = (tid, os.path.abspath(video_path))
+    cap = _THREAD_CAP_CACHE.get(key)
+    if cap is not None and cap.isOpened():
+        return cap
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(video_path)
+    if cap.isOpened():
+        _THREAD_CAP_CACHE[key] = cap
+    return cap
+
+
+def clear_video_capture_cache():
+    """Releases all cached cv2.VideoCapture handles across all threads."""
+    for cap in list(_THREAD_CAP_CACHE.values()):
+        try:
+            if cap and cap.isOpened():
+                cap.release()
+        except Exception:
+            pass
+    _THREAD_CAP_CACHE.clear()
+
+
 def _read_video_robust(ele: Dict[str, Any]):
     """
     Robust, ultra-fast OpenCV FFmpeg backend for qwen_vl_utils.
-    Uses cv2.VideoCapture with cv2.CAP_FFMPEG seeking, which decodes frames
-    across a 45-minute video in under 2 seconds cleanly without stalling.
+    Uses cached thread-local cv2.VideoCapture handles and fast in-flight downscaling
+    to decode frames across long videos cleanly without file re-opening overhead.
     """
     video_path = ele["video"]
     if video_path.startswith("file://"):
         video_path = video_path[7:]
 
     st = time.time()
-    print(f"[Video Processor] Opening video file via OpenCV FFmpeg: '{video_path}'...", file=sys.stderr)
 
-    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(video_path)
+    cap = get_video_capture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Failed to open video file: {video_path}")
 
@@ -87,6 +118,8 @@ def _read_video_robust(ele: Dict[str, Any]):
     segment_start_sec = start_frame / video_fps
     segment_end_sec = end_frame / video_fps
 
+    target_max_pixels = ele.get("max_pixels", DEFAULT_MAX_VIDEO_PIXELS)
+
     print(
         f"[Video Processor] Segment [{segment_start_sec:.1f}s -> {segment_end_sec:.1f}s] "
         f"Extracting {len(idx_list)} sampled frames across {total_frames} frames...",
@@ -94,20 +127,42 @@ def _read_video_robust(ele: Dict[str, Any]):
     )
 
     frames = []
+    curr_pos = -1
     for f_idx in idx_list:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-        ret, frame = cap.read()
-        if ret:
+        if curr_pos >= 0 and f_idx >= curr_pos and (f_idx - curr_pos) <= 5:
+            for _ in range(f_idx - curr_pos - 1):
+                if not cap.grab():
+                    break
+            ret, frame = cap.read()
+            curr_pos = f_idx if ret else -1
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            curr_pos = f_idx if ret else -1
+
+        if ret and frame is not None:
+            h, w = frame.shape[:2]
+            if h * w > target_max_pixels * 1.2:
+                scale = (target_max_pixels / (h * w)) ** 0.5
+                nw = max(32, int(w * scale))
+                nh = max(32, int(h * scale))
+                frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(torch.from_numpy(frame_rgb))
         else:
             cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, f_idx - 1))
             ret, frame = cap.read()
-            if ret:
+            if ret and frame is not None:
+                h, w = frame.shape[:2]
+                if h * w > target_max_pixels * 1.2:
+                    scale = (target_max_pixels / (h * w)) ** 0.5
+                    nw = max(32, int(w * scale))
+                    nh = max(32, int(h * scale))
+                    frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(torch.from_numpy(frame_rgb))
-
-    cap.release()
 
     if not frames:
         raise ValueError(f"Could not read any frames from video: {video_path}")
@@ -152,10 +207,10 @@ DEFAULT_MODEL_ID = None
 DEFAULT_MAX_VIDEO_PIXELS = 384 * 384
 MAX_TARGET_FRAMES = 64
 
-# Frames batched together per window for single-image (non video-native) models.
-# Each frame is encoded and held in VRAM concurrently during the batched generate() call,
-# so this bounds memory independently of how many frames a given phase requests (up to 64).
-IMAGE_ONLY_BATCH_FRAMES = 8
+# How many frames are encoded and held in VRAM *concurrently* in a single generate()
+# call for image-only models. Sampled frames per window are processed in chunks of this size
+# rather than all at once — peak VRAM scales with this number at the cost of sequential CUDA passes.
+IMAGE_ONLY_MICRO_BATCH_SIZE = 64
 
 
 class QwenVLModel:
@@ -172,7 +227,8 @@ class QwenVLModel:
         torch_dtype: str = "auto",
         uncensored: bool = True,
         quantization: Optional[str] = None,
-        use_sage_attention: bool = False,
+        use_sage_attention: bool = True,
+        image_only_micro_batch_size: int = IMAGE_ONLY_MICRO_BATCH_SIZE,
     ):
         self.model_name_or_path = model_name_or_path
         self.device = device
@@ -180,6 +236,9 @@ class QwenVLModel:
         self.uncensored = uncensored
         self.quantization = quantization
         self.use_sage_attention = use_sage_attention
+        # How many frames are encoded/decoded concurrently per generate() call for
+        # single-image (non video-native) models — see IMAGE_ONLY_MICRO_BATCH_SIZE.
+        self.image_only_micro_batch_size = max(1, image_only_micro_batch_size)
 
         self.model = None
         self.processor = None
@@ -187,11 +246,37 @@ class QwenVLModel:
         # True if this model's processor natively accepts multi-frame video input
         # (detected from the processor class, not the model name — see load_model()).
         self.is_video_native: bool = False
+        import threading
+        self._load_lock = threading.Lock()
+
+    def unload(self):
+        """Frees GPU VRAM by dropping the vision model and processor weights."""
+        with self._load_lock:
+            if not self.is_loaded:
+                clear_video_capture_cache()
+                return
+            print("💤 Unloading Vision Model from VRAM...", file=sys.stderr)
+            if self.model is not None:
+                del self.model
+                self.model = None
+            if self.processor is not None:
+                del self.processor
+                self.processor = None
+            self.is_loaded = False
+            clear_video_capture_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def load_model(self):
         """Loads Qwen2-VL / Qwen2.5-VL model in native bfloat16 / 4-bit onto device for maximum Tensor Core TFLOPS."""
-        if self.is_loaded:
-            return
+        with self._load_lock:
+            if self.is_loaded:
+                return
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         from .video_utils import resolve_model_path
         self.model_name_or_path = resolve_model_path(self.model_name_or_path)
@@ -249,7 +334,6 @@ class QwenVLModel:
             elif self.device in ["cuda", "cpu"]:
                 kwargs["device_map"] = self.device
 
-            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -389,6 +473,12 @@ class QwenVLModel:
             }
 
     @staticmethod
+    def _chunked(items: List[Any], size: int) -> List[List[Any]]:
+        """Splits a list into consecutive chunks of at most `size` items each."""
+        size = max(1, size)
+        return [items[i:i + size] for i in range(0, len(items), size)]
+
+    @staticmethod
     def _extract_pil_frames(
         video_path: str,
         video_start: Optional[float],
@@ -421,9 +511,19 @@ class QwenVLModel:
 
         pil_images = []
         timestamps = []
+        curr_pos = -1
         for f_idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-            ret, frame = cap.read()
+            if curr_pos >= 0 and f_idx >= curr_pos and (f_idx - curr_pos) <= 5:
+                for _ in range(f_idx - curr_pos - 1):
+                    if not cap.grab():
+                        break
+                ret, frame = cap.read()
+                curr_pos = f_idx if ret else -1
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+                ret, frame = cap.read()
+                curr_pos = f_idx if ret else -1
+
             if ret and frame is not None:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_images.append(Image.fromarray(rgb))
@@ -454,45 +554,59 @@ class QwenVLModel:
 
         if not self.is_video_native:
             pil_images, timestamps = self._extract_pil_frames(
-                video_path, video_start, video_end, IMAGE_ONLY_BATCH_FRAMES
+                video_path, video_start, video_end, max_frames
             )
 
+            image_token = getattr(self.processor, "image_token", "<image>")
             prompt_text = (
-                f"<image>\nWatch this video frame carefully. Question: Does this show the following: "
+                f"{image_token}\nWatch this video frame carefully. Question: Does this show the following: "
                 f"\"{target_prompt}\"? Answer ONLY YES or NO, followed by a brief reason."
             )
             msgs = [{"role": "user", "content": prompt_text}]
             try:
-                chat_prompt = self.processor.apply_chat_template(msgs, add_generation_prompt=True)
+                chat_prompt = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             except Exception:
-                image_token = getattr(self.processor, "image_token", "<image>")
                 chat_prompt = f"USER: {image_token}\n{prompt_text}\nASSISTANT:"
 
-            inputs = self.processor(
-                text=[chat_prompt] * len(pil_images),
-                images=pil_images,
-                padding=True,
-                return_tensors="pt",
+            chunk_groups = self._chunked(pil_images, self.image_only_micro_batch_size)
+            print(
+                f"[Image-Only Model] Evaluating {len(pil_images)} frame(s) in "
+                f"{len(chunk_groups)} chunk(s) of size(s) {[len(c) for c in chunk_groups]} "
+                f"(configured micro-batch: {self.image_only_micro_batch_size})",
+                file=sys.stderr,
             )
-            inputs = inputs.to(self.model.device)
 
             t0 = time.time()
-            with torch.inference_mode():
-                generated_ids = self.model.generate(
-                    **inputs, max_new_tokens=128, do_sample=False,
+            answers: List[str] = []
+            for chunk_images in chunk_groups:
+                inputs = self.processor(
+                    text=[chat_prompt] * len(chunk_images),
+                    images=chunk_images,
+                    padding=True,
+                    return_tensors="pt",
                 )
-            inference_time = time.time() - t0
+                inputs = inputs.to(self.model.device)
 
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):]
-                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            answers = [
-                a.strip() for a in self.processor.batch_decode(
-                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                with torch.inference_mode():
+                    generated_ids = self.model.generate(
+                        **inputs, max_new_tokens=128, do_sample=False,
+                    )
+
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):]
+                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                answers.extend(
+                    a.strip() for a in self.processor.batch_decode(
+                        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
                 )
-            ]
-            del inputs, generated_ids
+                del inputs, generated_ids, generated_ids_trimmed
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            inference_time = time.time() - t0
 
             hits = [(ts, ans) for ts, ans in zip(timestamps, answers) if ans.upper().startswith("YES")]
             is_yes = len(hits) > 0
@@ -589,25 +703,19 @@ class QwenVLModel:
 
         if not self.is_video_native:
             pil_images, timestamps = self._extract_pil_frames(
-                video_path, video_start, video_end, IMAGE_ONLY_BATCH_FRAMES
+                video_path, video_start, video_end, max_frames
             )
 
-            prompt_text = f"<image>\n{prompt}"
+            image_token = getattr(self.processor, "image_token", "<image>")
+            prompt_text = f"{image_token}\n{prompt}"
             msgs = [{"role": "user", "content": prompt_text}]
             try:
-                chat_prompt = self.processor.apply_chat_template(msgs, add_generation_prompt=True)
+                chat_prompt = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             except Exception:
-                image_token = getattr(self.processor, "image_token", "<image>")
                 chat_prompt = f"USER: {image_token}\n{prompt}\nASSISTANT:"
 
-            inputs = self.processor(
-                text=[chat_prompt] * len(pil_images),
-                images=pil_images,
-                padding=True,
-                return_tensors="pt",
-            )
             return {
-                "inputs": inputs,
+                "chat_prompt": chat_prompt,
                 "image_inputs": pil_images,
                 "video_inputs": None,
                 "frame_timestamps": timestamps,
@@ -649,24 +757,65 @@ class QwenVLModel:
     def describe_scene_from_inputs(self, prepared_data: Dict[str, Any]) -> str:
         """Runs GPU Vision Model inference on pre-extracted video frame tensors.
 
-        For single-image (non video-native) models, `prepared_data` holds a batch of
-        independently-encoded frames (batch dim = frame count); each is captioned separately
-        and the results are fused into one temporally-ordered description so the matcher's
-        one-description-per-window contract is unchanged regardless of model type.
+        For single-image (non video-native) models, `prepared_data` holds the extracted
+        PIL images and chat prompt. Chunks are tokenized and processed ONE AT A TIME
+        on-demand — purging each chunk's CPU/GPU tensors before tokenizing the next chunk,
+        guaranteeing that peak VRAM/RAM is strictly bounded by 1 micro-batch's tokens.
         """
-        inputs = prepared_data["inputs"].to(self.model.device)
         frame_timestamps = prepared_data.get("frame_timestamps")
 
-        # Batched multi-frame captions can be shorter individually; video-native single-call
-        # descriptions need the full budget.
-        max_new_tokens = 200 if frame_timestamps else 600
+        if "chat_prompt" in prepared_data:
+            pil_images = prepared_data["image_inputs"]
+            chat_prompt = prepared_data["chat_prompt"]
 
-        t0 = time.time()
+            chunks = self._chunked(pil_images, self.image_only_micro_batch_size)
+            chunk_sizes = [len(c) for c in chunks]
+            print(
+                f"[Image-Only Model] Captioning {len(frame_timestamps)} frame(s) in "
+                f"{len(chunks)} chunk(s) of size(s) {chunk_sizes} "
+                f"(configured micro-batch: {self.image_only_micro_batch_size})",
+                file=sys.stderr,
+            )
+
+            output_texts: List[str] = []
+            for chunk_images in chunks:
+                chunk_inputs = self.processor(
+                    text=[chat_prompt] * len(chunk_images),
+                    images=chunk_images,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                inputs = chunk_inputs.to(self.model.device)
+                with torch.inference_mode():
+                    generated_ids = self.model.generate(
+                        **inputs, max_new_tokens=200, do_sample=False,
+                    )
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):]
+                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                output_texts.extend(
+                    self.processor.batch_decode(
+                        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
+                )
+                del inputs, generated_ids, generated_ids_trimmed, chunk_inputs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+
+            full_desc = "Sequential frame observations:\n" + "\n".join(
+                f"[t={ts:.1f}s] {text.strip()}" for ts, text in zip(frame_timestamps, output_texts)
+            )
+            print(f"[Qwen Vision Model] Response:\n{full_desc}", file=sys.stderr)
+            return full_desc
+
+        inputs = prepared_data["inputs"].to(self.model.device)
         with torch.inference_mode():
             generated_ids = self.model.generate(
-                **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                **inputs, max_new_tokens=600, do_sample=False,
             )
-        inference_time = time.time() - t0
 
         generated_ids_trimmed = [
             out_ids[len(in_ids):]
@@ -675,13 +824,8 @@ class QwenVLModel:
         output_texts = self.processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-
-        if frame_timestamps:
-            description = "Sequential frame observations:\n" + "\n".join(
-                f"[t={ts:.1f}s] {text.strip()}" for ts, text in zip(frame_timestamps, output_texts)
-            )
-        else:
-            description = output_texts[0].strip()
+        description = output_texts[0].strip()
+        print(f"[Qwen Vision Model] Response:\n{description}", file=sys.stderr)
 
         del inputs, generated_ids
         return description
@@ -770,7 +914,8 @@ def get_cached_qwen_model(
     uncensored: bool = True,
     device: str = "auto",
     torch_dtype: str = "auto",
-    use_sage_attention: bool = False,
+    use_sage_attention: bool = True,
+    image_only_micro_batch_size: int = IMAGE_ONLY_MICRO_BATCH_SIZE,
 ) -> QwenVLModel:
     """
     Returns a cached global QwenVLModel GPU instance across runs.
@@ -780,6 +925,9 @@ def get_cached_qwen_model(
     If model_name_or_path is not given, uses the first vision model already installed in
     models_cache/hub/ (see detector.video_utils.scan_installed_models). Raises ValueError if
     none is installed yet.
+
+    image_only_micro_batch_size doesn't require a reload — it's applied to the cached instance
+    on every call, even when the rest of the settings are unchanged and the weights are reused.
     """
     global _cached_model_instance, _cached_model_key
 
@@ -797,6 +945,7 @@ def get_cached_qwen_model(
 
     if _cached_model_instance is not None and _cached_model_key == current_key and _cached_model_instance.is_loaded:
         print(f"[Model Cache] Reusing existing loaded GPU model instance for '{model_name_or_path}' (Quantization: {quantization})", file=sys.stderr)
+        _cached_model_instance.image_only_micro_batch_size = max(1, image_only_micro_batch_size)
         return _cached_model_instance
 
     # Clear previous model instance if settings changed
@@ -809,7 +958,6 @@ def get_cached_qwen_model(
             pass
         _cached_model_instance.is_loaded = False
         _cached_model_instance = None
-        import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -822,6 +970,7 @@ def get_cached_qwen_model(
         device=device,
         torch_dtype=torch_dtype,
         use_sage_attention=use_sage_attention,
+        image_only_micro_batch_size=image_only_micro_batch_size,
     )
     model_obj.load_model()
 

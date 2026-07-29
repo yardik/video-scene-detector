@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import gc
 import asyncio
 import threading
 import logging
@@ -35,6 +36,7 @@ from detector import (
     get_cached_text_llm,
 )
 from detector.video_utils import scan_installed_models, MODELS_CACHE_HUB_DIR
+from detector.qwen_model import IMAGE_ONLY_MICRO_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +72,11 @@ class BatchStartRequest(BaseModel):
     text_model_name: Optional[str] = None
     similarity_threshold: float = 50.0
     coarse_window_minutes: float = 2.0
-    coarse_frames: int = 64
+    coarse_frames: int = 16
     smart_motion_sampling: bool = False
-    use_sage_attention: bool = False
+    use_sage_attention: bool = True
+    image_only_micro_batch_size: int = IMAGE_ONLY_MICRO_BATCH_SIZE
+    text_llm_batch_size: int = 10
 
 
 class PathCheckRequest(BaseModel):
@@ -89,7 +93,9 @@ class DebugFrameRequest(BaseModel):
     text_model_name: Optional[str] = None
     similarity_threshold: float = 50.0
     smart_motion_sampling: bool = False
-    use_sage_attention: bool = False
+    use_sage_attention: bool = True
+    image_only_micro_batch_size: int = IMAGE_ONLY_MICRO_BATCH_SIZE
+    text_llm_batch_size: int = 10
 
 
 class PromptsUpdateRequest(BaseModel):
@@ -113,16 +119,36 @@ async def get_installed_models():
 async def download_model(req: ModelDownloadRequest):
     """Download a HuggingFace model to models_cache/hub/ using huggingface_hub."""
     model_id = req.model_id.strip()
+
+    # Clean up common pasted inputs like URLs or CLI commands (e.g. hf://org/repo/file or HF web URLs)
+    if "huggingface.co/" in model_id:
+        model_id = model_id.split("huggingface.co/")[-1].strip("/")
+    elif "hf://" in model_id:
+        model_id = model_id.split("hf://")[-1].strip("/")
+
+    if model_id.lower().startswith("hf download"):
+        model_id = model_id[len("hf download"):].strip()
+
+    parts = [p for p in model_id.split("/") if p]
+    if len(parts) >= 2:
+        model_id = f"{parts[0]}/{parts[1]}"
+
     if not model_id or "/" not in model_id:
         raise HTTPException(status_code=400, detail="Invalid model ID. Expected format: org/model-name")
 
     try:
         from huggingface_hub import snapshot_download
+        from detector.video_utils import _resolve_hf_token, _gated_repo_hint
         logger.info(f"Starting download of model: {model_id}")
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        models_dir = os.path.join(project_root, "models")
+        os.makedirs(models_dir, exist_ok=True)
+        sanitized = model_id.replace("/", "--").replace("\\", "--")
+        local_target = os.path.join(models_dir, sanitized)
         snapshot_download(
             repo_id=model_id,
-            cache_dir=MODELS_CACHE_HUB_DIR,
-            local_dir=None,
+            local_dir=local_target,
+            token=_resolve_hf_token(),
         )
         logger.info(f"Successfully downloaded model: {model_id}")
         # Return updated model lists
@@ -132,8 +158,9 @@ async def download_model(req: ModelDownloadRequest):
             "models": scan_installed_models(),
         }
     except Exception as e:
-        logger.error(f"Failed to download model {model_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to download model: {str(e)}")
+        hint = _gated_repo_hint(model_id, e)
+        logger.error(f"Failed to download model {model_id}: {hint}")
+        raise HTTPException(status_code=500, detail=f"Failed to download model: {hint}")
 
 
 @app.get("/api/prompts")
@@ -223,6 +250,7 @@ async def debug_frame(req: DebugFrameRequest):
         model = get_cached_qwen_model(
             model_name_or_path=req.model_name,
             quantization=quant_setting,
+            image_only_micro_batch_size=req.image_only_micro_batch_size,
         )
 
         t_total_start = time.time()
@@ -238,6 +266,8 @@ async def debug_frame(req: DebugFrameRequest):
                 max_frames=16,
             )
             t_vision_dur = round(time.time() - t_v0, 2)
+
+            model.unload()
 
             text_llm = get_cached_text_llm(
                 model_name_or_path=req.text_model_name,
@@ -279,6 +309,12 @@ async def debug_frame(req: DebugFrameRequest):
     except Exception as e:
         logger.error(f"Debug frame error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Model weights stay resident for reuse; only release cached-but-unused allocator
+        # memory left over from this frame's inference so it doesn't linger in nvidia-smi.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 
@@ -359,6 +395,8 @@ async def start_batch(req: BatchStartRequest):
         coarse_frames=req.coarse_frames,
         smart_motion_sampling=req.smart_motion_sampling,
         use_sage_attention=req.use_sage_attention,
+        image_only_micro_batch_size=req.image_only_micro_batch_size,
+        text_llm_batch_size=req.text_llm_batch_size,
     )
 
     def progress_callback(progress: BatchProgress, log_line: str):
@@ -400,6 +438,8 @@ async def stop_batch():
     global current_processor
     if current_processor:
         current_processor.cancel()
+        from detector.qwen_model import clear_video_capture_cache
+        clear_video_capture_cache()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         

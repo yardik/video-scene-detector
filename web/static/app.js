@@ -252,6 +252,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const coarseWindowValue = document.getElementById('coarseWindowValue');
   const coarseFramesSlider = document.getElementById('coarseFramesSlider');
   const coarseFramesValue = document.getElementById('coarseFramesValue');
+  const microBatchSlider = document.getElementById('microBatchSlider');
+  const microBatchValue = document.getElementById('microBatchValue');
+  const textLlmBatchSlider = document.getElementById('textLlmBatchSlider');
+  const textLlmBatchValue = document.getElementById('textLlmBatchValue');
+  const sageAttnCheck = document.getElementById('sageAttnCheck');
 
   if (dualModelCheck && textModelGroup) {
     dualModelCheck.addEventListener('change', () => {
@@ -269,6 +274,20 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function updateMicroBatchBounds(forceResetToMax = false) {
+    if (!coarseFramesSlider || !microBatchSlider || !microBatchValue) return;
+    const sampledFrames = parseInt(coarseFramesSlider.value) || 16;
+    const oldMax = parseInt(microBatchSlider.max) || 64;
+    const oldVal = parseInt(microBatchSlider.value) || 64;
+
+    microBatchSlider.max = sampledFrames;
+
+    if (forceResetToMax || oldVal >= oldMax || oldVal > sampledFrames) {
+      microBatchSlider.value = sampledFrames;
+    }
+    microBatchValue.textContent = `${microBatchSlider.value} frames`;
+  }
+
   if (coarseWindowSlider && coarseWindowValue) {
     coarseWindowSlider.addEventListener('input', () => {
       coarseWindowValue.textContent = `${parseFloat(coarseWindowSlider.value).toFixed(1)} min`;
@@ -278,8 +297,27 @@ document.addEventListener('DOMContentLoaded', () => {
   if (coarseFramesSlider && coarseFramesValue) {
     coarseFramesSlider.addEventListener('input', () => {
       coarseFramesValue.textContent = `${coarseFramesSlider.value} frames`;
+      updateMicroBatchBounds();
     });
   }
+
+  if (microBatchSlider && microBatchValue) {
+    microBatchSlider.addEventListener('input', () => {
+      const maxVal = parseInt(microBatchSlider.max) || 64;
+      if (parseInt(microBatchSlider.value) > maxVal) {
+        microBatchSlider.value = maxVal;
+      }
+      microBatchValue.textContent = `${microBatchSlider.value} frames`;
+    });
+  }
+
+  if (textLlmBatchSlider && textLlmBatchValue) {
+    textLlmBatchSlider.addEventListener('input', () => {
+      textLlmBatchValue.textContent = `${textLlmBatchSlider.value} items`;
+    });
+  }
+
+  updateMicroBatchBounds(true);
 
   async function startBatch() {
     const inputDir = inputDirInput.value.trim();
@@ -315,9 +353,11 @@ document.addEventListener('DOMContentLoaded', () => {
           text_model_name: textModelSelect ? textModelSelect.value : null,
           similarity_threshold: similarityThresholdSlider ? parseFloat(similarityThresholdSlider.value) : 50.0,
           coarse_window_minutes: coarseWindowSlider ? parseFloat(coarseWindowSlider.value) : 3.0,
-          coarse_frames: coarseFramesSlider ? parseInt(coarseFramesSlider.value) : 32,
+          coarse_frames: coarseFramesSlider ? parseInt(coarseFramesSlider.value) : 16,
           smart_motion_sampling: document.getElementById('smartMotionCheck') ? document.getElementById('smartMotionCheck').checked : false,
-          use_sage_attention: document.getElementById('sageAttnCheck') ? document.getElementById('sageAttnCheck').checked : false,
+          use_sage_attention: sageAttnCheck ? sageAttnCheck.checked : true,
+          image_only_micro_batch_size: microBatchSlider ? parseInt(microBatchSlider.value) : 64,
+          text_llm_batch_size: textLlmBatchSlider ? parseInt(textLlmBatchSlider.value) : 10,
         }),
       });
 
@@ -620,6 +660,8 @@ document.addEventListener('DOMContentLoaded', () => {
           dual_model: isDual,
           text_model_name: debugTextModelSelect ? debugTextModelSelect.value : null,
           similarity_threshold: debugSimilarityThresholdSlider ? parseFloat(debugSimilarityThresholdSlider.value) : 80.0,
+          image_only_micro_batch_size: microBatchSlider ? parseInt(microBatchSlider.value) : 64,
+          text_llm_batch_size: textLlmBatchSlider ? parseInt(textLlmBatchSlider.value) : 10,
         }),
       });
 
