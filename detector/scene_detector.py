@@ -618,8 +618,8 @@ class VideoSceneDetector:
 
             from concurrent.futures import ThreadPoolExecutor
 
-            unoverlapped_extract_sec = 0.0
-            masked_extract_sec = 0.0
+            total_gpu_stall_sec = 0.0
+            initial_setup_sec = 0.0
 
             def _prep_window(w):
                 t_ext0 = time.time()
@@ -646,8 +646,15 @@ class VideoSceneDetector:
                 for idx, (w_start, w_end) in enumerate(windows, 1):
                     if is_cancelled and is_cancelled():
                         raise InterruptedError("Operation cancelled by user")
+                    t_pop0 = time.time()
                     prepared_data = pending.popleft().result()
+                    pop_wait_sec = time.time() - t_pop0
                     extract_dur = prepared_data.get("_extraction_duration", 0.0)
+
+                    if idx == 1:
+                        initial_setup_sec = pop_wait_sec
+                    else:
+                        total_gpu_stall_sec += pop_wait_sec
 
                     if next_idx < len(windows):
                         pending.append(executor.submit(_prep_window, windows[next_idx]))
@@ -666,21 +673,13 @@ class VideoSceneDetector:
                         prepared_data["image_inputs"].clear()
                     del prepared_data
 
-                    if idx == 1:
-                        unoverlapped_extract_sec += extract_dur
-                    else:
-                        if dt_gpu >= extract_dur:
-                            masked_extract_sec += extract_dur
-                        else:
-                            unoverlapped_extract_sec += (extract_dur - dt_gpu)
-                            masked_extract_sec += dt_gpu
-
-                    log_msg(f"    [Vision Desc {idx}/{len(windows)}] [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] (GPU: {dt_gpu:.1f}s | Extract Lost: {unoverlapped_extract_sec:.2f}s):\n{desc}")
+                    stall_str = f"GPU Stall: {total_gpu_stall_sec:.2f}s" if total_gpu_stall_sec > 0.05 else "GPU Idle: 0.00s (100% Masked)"
+                    log_msg(f"    [Vision Desc {idx}/{len(windows)}] [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] (GPU: {dt_gpu:.1f}s | {stall_str}):\n{desc}")
 
             if tracker:
-                tracker.active_frame_extract_sec += unoverlapped_extract_sec
+                tracker.active_frame_extract_sec += (initial_setup_sec + total_gpu_stall_sec)
 
-            log_msg(f"  ⏱️ Frame Extraction Timing Metrics: Un-overlapped Lost Time: {unoverlapped_extract_sec:.2f}s | GPU-Masked Time: {masked_extract_sec:.2f}s")
+            log_msg(f"  ⏱️ Frame Extraction Timing Metrics: Initial Setup: {initial_setup_sec:.2f}s | GPU Idle Stall: {total_gpu_stall_sec:.2f}s (All extractions running asynchronously on CPU)")
 
             # Unload video vision model entirely before doing text LLM classification
             self.model.unload()
