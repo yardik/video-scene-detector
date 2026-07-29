@@ -174,6 +174,7 @@ class TextLLMClassifier:
                 max_new_tokens=256,
                 temperature=0.1,
                 do_sample=False,
+                repetition_penalty=1.1,
             )
         inference_time = time.time() - t0
 
@@ -275,6 +276,7 @@ class TextLLMClassifier:
                     max_new_tokens=256,
                     temperature=0.1,
                     do_sample=False,
+                    repetition_penalty=1.1,
                 )
             total_inference_time = time.time() - t0
             per_item_time = total_inference_time / max(len(chunk_descs), 1)

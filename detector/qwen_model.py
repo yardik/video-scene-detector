@@ -596,7 +596,7 @@ class QwenVLModel:
 
                 with torch.inference_mode():
                     generated_ids = self.model.generate(
-                        **inputs, max_new_tokens=128, do_sample=False,
+                        **inputs, max_new_tokens=128, do_sample=False, repetition_penalty=1.1,
                     )
 
                 generated_ids_trimmed = [
@@ -667,7 +667,7 @@ class QwenVLModel:
         t0 = time.time()
         with torch.inference_mode():
             generated_ids = self.model.generate(
-                **inputs, max_new_tokens=256, do_sample=False,
+                **inputs, max_new_tokens=256, do_sample=False, repetition_penalty=1.1,
             )
         inference_time = time.time() - t0
 
@@ -795,7 +795,7 @@ class QwenVLModel:
                 inputs = chunk_inputs.to(self.model.device)
                 with torch.inference_mode():
                     generated_ids = self.model.generate(
-                        **inputs, max_new_tokens=200, do_sample=False,
+                        **inputs, max_new_tokens=200, do_sample=False, repetition_penalty=1.1,
                     )
                 generated_ids_trimmed = [
                     out_ids[len(in_ids):]
@@ -821,7 +821,7 @@ class QwenVLModel:
         inputs = prepared_data["inputs"].to(self.model.device)
         with torch.inference_mode():
             generated_ids = self.model.generate(
-                **inputs, max_new_tokens=600, do_sample=False,
+                **inputs, max_new_tokens=600, do_sample=False, repetition_penalty=1.1,
             )
 
         generated_ids_trimmed = [

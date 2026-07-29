@@ -152,10 +152,11 @@ class VideoSceneDetector:
         max_frames: int = MAX_TARGET_FRAMES,
         max_pixels: int = DEFAULT_MAX_VIDEO_PIXELS,
         tracker: Optional[ExecutionTracker] = None,
+        keep_models_loaded: bool = False,
     ) -> Tuple[bool, str]:
         """Evaluates a single condition using either single Qwen2-VL or Dual-Model pipeline."""
         if self.dual_model and self.text_llm:
-            if self.text_llm.is_loaded:
+            if not keep_models_loaded and self.text_llm.is_loaded:
                 self.text_llm.unload()
 
             t0 = time.time()
@@ -171,7 +172,8 @@ class VideoSceneDetector:
             if tracker:
                 tracker.vision_inference_sec += dt_vision
 
-            self.model.unload()
+            if not keep_models_loaded:
+                self.model.unload()
 
             t0 = time.time()
             is_match, reason = self.text_llm.classify_description(
@@ -207,6 +209,7 @@ class VideoSceneDetector:
         max_frames: int = MAX_TARGET_FRAMES,
         max_pixels: int = DEFAULT_MAX_VIDEO_PIXELS,
         tracker: Optional[ExecutionTracker] = None,
+        keep_models_loaded: bool = False,
     ) -> Tuple[bool, str]:
         def log_msg(msg: str):
             if tracker:
@@ -223,6 +226,7 @@ class VideoSceneDetector:
                 max_frames=max_frames,
                 max_pixels=max_pixels,
                 tracker=tracker,
+                keep_models_loaded=keep_models_loaded,
             )
             tag = "YES" if detected else "NO"
             if len(conditions) > 1:
@@ -1014,6 +1018,7 @@ class VideoSceneDetector:
                 max_frames=self.FINE_FRAMES,
                 max_pixels=self.FINE_MAX_PIXELS,
                 tracker=tracker,
+                keep_models_loaded=True,
             )
             dt = time.time() - t0
             step += 1
@@ -1074,6 +1079,7 @@ class VideoSceneDetector:
                 max_frames=self.FINE_FRAMES,
                 max_pixels=self.FINE_MAX_PIXELS,
                 tracker=tracker,
+                keep_models_loaded=True,
             )
             dt = time.time() - t0
             step += 1
