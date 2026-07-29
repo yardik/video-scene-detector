@@ -635,7 +635,7 @@ class VideoSceneDetector:
                 return data
 
             from collections import deque
-            PREFETCH_DEPTH = 2
+            PREFETCH_DEPTH = 1
             with ThreadPoolExecutor(max_workers=PREFETCH_DEPTH + 1) as executor:
                 pending = deque(
                     executor.submit(_prep_window, w)
@@ -791,7 +791,7 @@ class VideoSceneDetector:
             # ahead of the one currently running GPU inference, so a slow extraction
             # (e.g. a window needing a big seek) has more than one window's worth of
             # GPU compute time to hide behind before it can stall the pipeline.
-            PREFETCH_DEPTH = 2
+            PREFETCH_DEPTH = 1
             with ThreadPoolExecutor(max_workers=PREFETCH_DEPTH + 1) as executor:
                 pending = deque(
                     executor.submit(_prep_sub_window, w)

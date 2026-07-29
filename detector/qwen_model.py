@@ -68,12 +68,14 @@ def print_vram_stats(tag: str = ""):
 _THREAD_CAP_CACHE: Dict[Tuple[int, str], Any] = {}
 
 
+_OPENCV_LOCK = threading.Lock()
+
+
 def get_video_capture(video_path: str) -> cv2.VideoCapture:
     """
     Returns a thread-cached open cv2.VideoCapture handle for `video_path`.
     Prevents reopening the video file and re-parsing container stream headers on every window.
     """
-    import threading
     tid = threading.get_ident()
     key = (tid, os.path.abspath(video_path))
     cap = _THREAD_CAP_CACHE.get(key)
@@ -103,6 +105,7 @@ def _read_video_robust(ele: Dict[str, Any]):
     Robust, ultra-fast OpenCV FFmpeg backend for qwen_vl_utils.
     Uses cached thread-local cv2.VideoCapture handles and fast in-flight downscaling
     to decode frames across long videos cleanly without file re-opening overhead.
+    Protected by _OPENCV_LOCK to guarantee C++ thread-safety across background workers.
     """
     video_path = ele["video"]
     if video_path.startswith("file://"):
@@ -110,61 +113,51 @@ def _read_video_robust(ele: Dict[str, Any]):
 
     st = time.time()
 
-    cap = get_video_capture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Failed to open video file: {video_path}")
-
-    video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        total_frames = 100
-
-    start_frame, end_frame, num_frames_range = vp.calculate_video_frame_range(
-        ele, total_frames, video_fps
-    )
-    nframes = vp.smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
-
-    idx_tensor = torch.linspace(start_frame, end_frame, nframes).round().long()
-    idx_list = idx_tensor.tolist()
-
-    segment_start_sec = start_frame / video_fps
-    segment_end_sec = end_frame / video_fps
-
+    video_fps = 30.0
+    total_frames = 100
     target_max_pixels = ele.get("max_pixels", DEFAULT_MAX_VIDEO_PIXELS)
 
-    print(
-        f"[Video Processor] Segment [{segment_start_sec:.1f}s -> {segment_end_sec:.1f}s] "
-        f"Extracting {len(idx_list)} sampled frames across {total_frames} frames...",
-        file=sys.stderr,
-    )
+    with _OPENCV_LOCK:
+        cap = get_video_capture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video file: {video_path}")
 
-    frames = []
-    curr_pos = -1
-    for f_idx in idx_list:
-        if curr_pos >= 0 and f_idx >= curr_pos and (f_idx - curr_pos) <= 5:
-            for _ in range(f_idx - curr_pos - 1):
-                if not cap.grab():
-                    break
-            ret, frame = cap.read()
-            curr_pos = f_idx if ret else -1
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-            ret, frame = cap.read()
-            curr_pos = f_idx if ret else -1
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = 100
 
-        if ret and frame is not None:
-            h, w = frame.shape[:2]
-            if h * w > target_max_pixels * 1.2:
-                scale = (target_max_pixels / (h * w)) ** 0.5
-                nw = max(32, int(w * scale))
-                nh = max(32, int(h * scale))
-                frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        start_frame, end_frame, num_frames_range = vp.calculate_video_frame_range(
+            ele, total_frames, video_fps
+        )
+        nframes = vp.smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(torch.from_numpy(frame_rgb))
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, f_idx - 1))
-            ret, frame = cap.read()
+        idx_tensor = torch.linspace(start_frame, end_frame, nframes).round().long()
+        idx_list = idx_tensor.tolist()
+
+        segment_start_sec = start_frame / video_fps
+        segment_end_sec = end_frame / video_fps
+
+        print(
+            f"[Video Processor] Segment [{segment_start_sec:.1f}s -> {segment_end_sec:.1f}s] "
+            f"Extracting {len(idx_list)} sampled frames across {total_frames} frames...",
+            file=sys.stderr,
+        )
+
+        frames = []
+        curr_pos = -1
+        for f_idx in idx_list:
+            if curr_pos >= 0 and f_idx >= curr_pos and (f_idx - curr_pos) <= 5:
+                for _ in range(f_idx - curr_pos - 1):
+                    if not cap.grab():
+                        break
+                ret, frame = cap.read()
+                curr_pos = f_idx if ret else -1
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+                ret, frame = cap.read()
+                curr_pos = f_idx if ret else -1
+
             if ret and frame is not None:
                 h, w = frame.shape[:2]
                 if h * w > target_max_pixels * 1.2:
@@ -175,6 +168,19 @@ def _read_video_robust(ele: Dict[str, Any]):
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(torch.from_numpy(frame_rgb))
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, f_idx - 1))
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    h, w = frame.shape[:2]
+                    if h * w > target_max_pixels * 1.2:
+                        scale = (target_max_pixels / (h * w)) ** 0.5
+                        nw = max(32, int(w * scale))
+                        nh = max(32, int(h * scale))
+                        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(torch.from_numpy(frame_rgb))
 
     if not frames:
         raise ValueError(f"Could not read any frames from video: {video_path}")
