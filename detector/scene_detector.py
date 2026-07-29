@@ -656,9 +656,8 @@ class VideoSceneDetector:
                     else:
                         total_gpu_stall_sec += pop_wait_sec
 
-                    if next_idx < len(windows):
-                        pending.append(executor.submit(_prep_window, windows[next_idx]))
-                        next_idx += 1
+                    stall_str = f"GPU Stall: {total_gpu_stall_sec:.2f}s" if total_gpu_stall_sec > 0.05 else "GPU Idle: 0.00s (100% Masked)"
+                    log_msg(f"  ⚡ [Vision GPU {idx}/{len(windows)}] Running inference [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] ({stall_str})...")
 
                     t_gpu0 = time.time()
                     desc = self.model.describe_scene_from_inputs(prepared_data)
@@ -673,8 +672,7 @@ class VideoSceneDetector:
                         prepared_data["image_inputs"].clear()
                     del prepared_data
 
-                    stall_str = f"GPU Stall: {total_gpu_stall_sec:.2f}s" if total_gpu_stall_sec > 0.05 else "GPU Idle: 0.00s (100% Masked)"
-                    log_msg(f"    [Vision Desc {idx}/{len(windows)}] [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] (GPU: {dt_gpu:.1f}s | {stall_str}):\n{desc}")
+                    log_msg(f"    [Vision Desc {idx}/{len(windows)}] [{VideoUtils.format_timestamp(w_start)}..{VideoUtils.format_timestamp(w_end)}] (GPU: {dt_gpu:.1f}s):\n{desc}")
 
             if tracker:
                 tracker.active_frame_extract_sec += (initial_setup_sec + total_gpu_stall_sec)
@@ -807,6 +805,9 @@ class VideoSceneDetector:
                     if next_idx < len(all_windows):
                         pending.append(executor.submit(_prep_sub_window, all_windows[next_idx]))
                         next_idx += 1
+
+                    w_sub = all_windows[idx-1]
+                    log_msg(f"  ⚡ [Vision GPU {idx}/{len(all_windows)}] Running sub-window inference [{VideoUtils.format_timestamp(w_sub[1])}..{VideoUtils.format_timestamp(w_sub[2])}]...")
 
                     t_gpu0 = time.time()
                     desc = self.model.describe_scene_from_inputs(prepared_data)
